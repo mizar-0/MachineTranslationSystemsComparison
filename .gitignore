@@ -1,0 +1,15 @@
+# Generated datasets and model artifacts
+data/*
+checkpoints/
+models/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.vscode/
+.idea/

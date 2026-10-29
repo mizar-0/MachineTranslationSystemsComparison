@@ -5,6 +5,8 @@ import argparse
 import json
 import math
 import time
+import platform
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -82,8 +84,22 @@ def main():
     loss_fn = nn.CrossEntropyLoss(ignore_index=pad)
     best, best_state, stale, patience = float("inf"), None, 0, 4
     history = []
+    log_dir = OUT / "logs" / "transformer"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_config = {"model": "scratch_transformer", "tokenizer": args.tokenizer,
+        "epochs_requested": args.epochs, "batch_size": args.batch_size,
+        "max_train": args.max_train, "max_length": args.max_length,
+        "d_model": args.d_model, "seed": SEED, "device": str(device),
+        "torch_version": torch.__version__, "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "python": platform.python_version()}
+    try: run_config["git_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=OUT.parents[0], text=True).strip()
+    except Exception: run_config["git_commit"] = None
+    save_json(log_dir / "run_config.json", run_config)
+    epoch_log = (log_dir / "epochs.jsonl").open("w", encoding="utf-8")
     start = time.perf_counter()
     for epoch in range(args.epochs):
+        epoch_start = time.perf_counter()
         model.train(); total = 0.0
         for src, tgt in train:
             src, tgt = src.to(device), tgt.to(device)
@@ -99,15 +115,22 @@ def main():
                 logits = model(src, tgt[:, :-1])
                 vtotal += loss_fn(logits.reshape(-1, logits.size(-1)), tgt[:, 1:].reshape(-1)).item()
         tr_loss, val_loss = total / len(train), vtotal / len(valid)
-        history.append({"epoch": epoch + 1, "train_loss": tr_loss, "validation_loss": val_loss})
-        print(f"epoch {epoch+1}: train={tr_loss:.4f} val={val_loss:.4f}", flush=True)
+        epoch_record = {"epoch": epoch + 1, "train_loss": tr_loss, "validation_loss": val_loss,
+                        "epoch_seconds": time.perf_counter() - epoch_start,
+                        "elapsed_seconds": time.perf_counter() - start,
+                        "gpu_memory_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None}
+        history.append(epoch_record)
+        epoch_log.write(json.dumps(epoch_record) + "\n"); epoch_log.flush()
+        print(json.dumps(epoch_record), flush=True)
         if val_loss < best:
             best, stale = val_loss, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            torch.save({"state_dict": best_state, "config": run_config, "best_validation_loss": best}, log_dir / "best_checkpoint.pt")
         else:
             stale += 1
             if stale >= patience: break
     train_seconds = time.perf_counter() - start
+    epoch_log.close()
     model.load_state_dict(best_state); model.eval()
     outdir = OUT / "transformer"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +160,10 @@ def main():
         "training_seconds":train_seconds,"inference_seconds":infer_seconds,"seconds_per_sentence":infer_seconds/len(test_en),
         "total_parameters":total_params,"trainable_parameters":total_params,"best_validation_loss":best,
         "train_history":history,"seed":SEED,"train_pairs":len(train_en),"validation_pairs":len(val_en),"test_pairs":len(test_en),**metrics})
+    save_json(log_dir / "final_summary.json", {"train_seconds": train_seconds,
+        "inference_seconds": infer_seconds, "best_validation_loss": best,
+        "test_metrics": metrics, "test_sentences": len(test_en),
+        "parameter_count": total_params, "history": history})
 
 
 if __name__ == "__main__": main()

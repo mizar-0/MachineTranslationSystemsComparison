@@ -1,0 +1,12 @@
+# Core stack mirrored from the local CUDA-enabled project environment
+# The base environment supplies torch 2.11.0+cu128
+transformers>=4.48,<5
+datasets>=3.2
+sentencepiece>=0.2
+sacrebleu>=2.5
+accelerate>=1.2
+peft>=0.14
+bitsandbytes>=0.45; platform_system == "Linux"
+tokenizers>=0.21
+pandas>=2.2
+matplotlib>=3.9

@@ -2,7 +2,13 @@
 data/*
 checkpoints/
 models/
-outputs/
+outputs/*
+!outputs/metrics/
+!outputs/predictions/
+!outputs/logs/
+outputs/metrics/*
+outputs/predictions/*
+outputs/logs/*
 
 # Python
 __pycache__/

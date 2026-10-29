@@ -100,6 +100,10 @@ def main():
     parser.add_argument("--model", choices=DEFAULT_MODELS, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model-id")
+    parser.add_argument(
+        "--model-path",
+        help="Optional local snapshot path; the source model ID is still recorded",
+    )
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--patience", type=int, default=1)
     parser.add_argument("--min-delta", type=float, default=0.002)
@@ -120,6 +124,7 @@ def main():
 
     seed_everything()
     model_id = args.model_id or DEFAULT_MODELS[args.model]
+    model_load_path = args.model_path or model_id
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cuda = device.type == "cuda"
     use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
@@ -130,14 +135,15 @@ def main():
     save_json(run_dir / "status.json", {
         "state": "downloading_model", "started_at_utc": started_at,
         "model": args.model, "model_id": model_id,
+        "model_load_path": model_load_path,
     })
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_load_path, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=dtype, low_cpu_mem_usage=True,
+        model_load_path, dtype=dtype, low_cpu_mem_usage=True,
     )
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.use_cache = False
@@ -185,7 +191,8 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and not use_bf16)
 
     run_config = {
-        **vars(args), "model_id": model_id, "seed": SEED, "device": str(device),
+        **vars(args), "model_id": model_id, "model_load_path": model_load_path,
+        "seed": SEED, "device": str(device),
         "python": platform.python_version(), "torch": torch.__version__,
         "cuda_runtime": torch.version.cuda,
         "transformers_model_type": model.config.model_type,
@@ -333,7 +340,7 @@ def main():
     if use_cuda:
         torch.cuda.empty_cache()
     base_model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=dtype, low_cpu_mem_usage=True,
+        model_load_path, dtype=dtype, low_cpu_mem_usage=True,
     )
     model = PeftModel.from_pretrained(base_model, run_dir / "best_adapter").to(device)
     model.config.pad_token_id = tokenizer.pad_token_id

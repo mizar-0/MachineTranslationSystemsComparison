@@ -7,3 +7,4 @@ sacrebleu>=2.5
 accelerate>=1.2
 peft>=0.14
 tokenizers>=0.21
+hf-xet>=1.1

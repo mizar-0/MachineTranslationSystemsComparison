@@ -90,7 +90,9 @@ def main():
 
     seed_everything()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
+    use_cuda = device.type == "cuda"
+    use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
+    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
     run_dir = OUT / "runs" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     started_at = datetime.now(timezone.utc).isoformat()
@@ -116,11 +118,11 @@ def main():
     collate = make_collator(tokenizer)
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, generator=generator,
-        collate_fn=collate, pin_memory=use_amp,
+        collate_fn=collate, pin_memory=use_cuda,
     )
     dev_loader = DataLoader(
         dev_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate, pin_memory=use_amp,
+        collate_fn=collate, pin_memory=use_cuda,
     )
 
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -130,16 +132,16 @@ def main():
     total_optimizer_steps = optimizer_steps_per_epoch * args.epochs
     warmup_steps = int(total_optimizer_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_optimizer_steps)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda and not use_bf16)
 
     run_config = {
         **vars(args), "seed": SEED, "device": str(device), "python": platform.python_version(),
         "torch": torch.__version__, "cuda_runtime": torch.version.cuda,
         "transformers_model_type": model.config.model_type,
         "model_revision": getattr(model.config, "_commit_hash", None),
-        "gpu": torch.cuda.get_device_name(0) if use_amp else None,
-        "gpu_total_memory_bytes": torch.cuda.get_device_properties(0).total_memory if use_amp else None,
-        "mixed_precision": "fp16" if use_amp else "fp32",
+        "gpu": torch.cuda.get_device_name(0) if use_cuda else None,
+        "gpu_total_memory_bytes": torch.cuda.get_device_properties(0).total_memory if use_cuda else None,
+        "mixed_precision": "bf16" if use_bf16 else ("fp16" if use_cuda else "fp32"),
         "gradient_checkpointing": True,
         "total_parameters": total_parameters, "trainable_parameters": trainable_parameters,
         "train_pairs": len(train_en), "validation_pairs": len(dev_en), "test_pairs": len(test_en),
@@ -169,7 +171,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         epoch_started = time.perf_counter()
-        if use_amp:
+        if use_cuda:
             torch.cuda.reset_peak_memory_stats()
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -179,7 +181,7 @@ def main():
         grad_norm_count = 0
         for batch_index, batch in enumerate(train_loader, start=1):
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=autocast_dtype, enabled=use_cuda):
                 raw_loss = model(**batch).loss
                 loss = raw_loss / args.gradient_accumulation
             scaler.scale(loss).backward()
@@ -190,20 +192,23 @@ def main():
             if update_now:
                 scaler.unscale_(optimizer)
                 grad_norm = float(clip_grad_norm_(model.parameters(), 1.0))
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                optimizer_step += 1
-                grad_norm_sum += grad_norm
-                grad_norm_count += 1
-                if optimizer_step % args.log_every == 0:
+                step_was_skipped = scaler.get_scale() < scale_before
+                if not step_was_skipped:
+                    scheduler.step()
+                    optimizer_step += 1
+                    grad_norm_sum += grad_norm
+                    grad_norm_count += 1
+                if not step_was_skipped and optimizer_step % args.log_every == 0:
                     record = {
                         "optimizer_step": optimizer_step, "micro_step": global_micro_step,
                         "epoch": epoch, "batch": batch_index, "loss": float(raw_loss.detach()),
                         "learning_rate": scheduler.get_last_lr()[0], "gradient_norm": grad_norm,
                         "elapsed_seconds": time.perf_counter() - training_started,
-                        "gpu_memory_allocated_bytes": torch.cuda.memory_allocated() if use_amp else None,
+                        "gpu_memory_allocated_bytes": torch.cuda.memory_allocated() if use_cuda else None,
                     }
                     step_log.write(json.dumps(record) + "\n")
                     step_log.flush()
@@ -213,7 +218,7 @@ def main():
         with torch.inference_mode():
             for batch in dev_loader:
                 batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                with torch.amp.autocast("cuda", dtype=autocast_dtype, enabled=use_cuda):
                     validation_loss += float(model(**batch).loss)
         train_loss = loss_sum / batches
         val_loss = validation_loss / len(dev_loader)
@@ -240,7 +245,7 @@ def main():
             "mean_gradient_norm": grad_norm_sum / max(1, grad_norm_count),
             "epoch_seconds": time.perf_counter() - epoch_started,
             "elapsed_seconds": time.perf_counter() - training_started,
-            "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if use_amp else None,
+            "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if use_cuda else None,
             "improved": improved, "stale_epochs": stale_epochs,
         }
         history.append(epoch_record)
@@ -260,7 +265,7 @@ def main():
     step_log.close()
     training_seconds = time.perf_counter() - training_started
     del model
-    if use_amp:
+    if use_cuda:
         torch.cuda.empty_cache()
     model = AutoModelForSeq2SeqLM.from_pretrained(run_dir / "best_model").to(device)
     model.config.use_cache = True

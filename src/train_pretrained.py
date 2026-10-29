@@ -7,15 +7,8 @@ import time
 from pathlib import Path
 
 import torch
-from datasets import Dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
-    AutoTokenizer,
-    DataCollatorForSeq2Seq,
-    Trainer,
-    TrainingArguments,
-)
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 from common import DATA, OUT, SEED, count_parameters, evaluate, save_json, seed_everything, split_data, timed_generate
@@ -25,6 +18,37 @@ MODELS = {
     "llama": ("meta-llama/Llama-3.2-1B", "causal"),
     "gemma": ("google/gemma-3-1b-it", "causal"),
 }
+
+
+class EncodedPairs(Dataset):
+    def __init__(self, sources, targets, tokenizer, architecture, max_length):
+        self.rows = []
+        for source, target in zip(sources, targets):
+            prompt = f"Translate English to Hindi: {source}\nHindi:" if architecture == "causal" else f"translate English to Hindi: {source}"
+            if architecture == "causal":
+                complete = tokenizer(prompt + " " + target, truncation=True, max_length=max_length)
+                prompt_ids = tokenizer(prompt, truncation=True, max_length=max_length)["input_ids"]
+                labels = complete["input_ids"].copy()
+                labels[:len(prompt_ids)] = [-100] * min(len(prompt_ids), len(labels))
+            else:
+                complete = tokenizer(prompt, truncation=True, max_length=max_length)
+                labels = tokenizer(text_target=target, truncation=True, max_length=max_length)["input_ids"]
+            self.rows.append((complete["input_ids"], labels))
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, i): return self.rows[i]
+
+
+def make_collator(tokenizer):
+    def collate(rows):
+        max_input = max(len(x[0]) for x in rows)
+        max_label = max(len(x[1]) for x in rows)
+        ids, masks, labels = [], [], []
+        for input_ids, label_ids in rows:
+            ids.append(input_ids + [tokenizer.pad_token_id] * (max_input - len(input_ids)))
+            masks.append([1] * len(input_ids) + [0] * (max_input - len(input_ids)))
+            labels.append(label_ids + [-100] * (max_label - len(label_ids)))
+        return {"input_ids": torch.tensor(ids), "attention_mask": torch.tensor(masks), "labels": torch.tensor(labels)}
+    return collate
 
 
 def main() -> None:
@@ -53,10 +77,7 @@ def main() -> None:
     model_cls = AutoModelForSeq2SeqLM if architecture == "seq2seq" else AutoModelForCausalLM
     load_kwargs = {"torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32}
     if torch.cuda.is_available() and architecture == "causal":
-        try:
-            load_kwargs.update(load_in_4bit=True, device_map="auto")
-        except Exception:
-            pass
+        load_kwargs["device_map"] = "auto"
     model = model_cls.from_pretrained(model_id, **load_kwargs)
     if architecture == "causal":
         model.config.pad_token_id = tokenizer.pad_token_id
@@ -67,41 +88,41 @@ def main() -> None:
             task_type="CAUSAL_LM", target_modules="all-linear",
         ))
 
-    def encode_batch(sources: list[str], targets: list[str], causal: bool):
-        prompts = [f"Translate English to Hindi: {s}\nHindi:" for s in sources] if causal else [f"translate English to Hindi: {s}" for s in sources]
-        encoded = tokenizer(prompts, max_length=args.max_length, truncation=True)
-        labels = tokenizer(text_target=targets, max_length=args.max_length, truncation=True)
-        encoded["labels"] = labels["input_ids"]
-        if causal:
-            # The trainer uses tokenized target Hindi as labels. Mask source tokens.
-            for row, source_len in zip(encoded["labels"], [len(x) for x in encoded["input_ids"]]):
-                row[:source_len] = [-100] * min(source_len, len(row))
-        return encoded
-
-    def dataset(sources, targets):
-        rows = encode_batch(sources, targets, architecture == "causal")
-        return Dataset.from_dict(rows)
-
-    train_ds = dataset(train_en, train_hi)
-    val_ds = dataset(val_en, val_hi)
-    collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, pad_to_multiple_of=8)
-    training_args = TrainingArguments(
-        output_dir=str(output / "checkpoints"), num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=2e-4 if architecture == "causal" else 5e-4,
-        fp16=torch.cuda.is_available(), gradient_checkpointing=architecture == "causal",
-        eval_strategy="epoch", save_strategy="epoch", load_best_model_at_end=True,
-        metric_for_best_model="eval_loss", greater_is_better=False,
-        logging_steps=100, report_to="none", seed=SEED,
-    )
-    trainer = Trainer(model=model, args=training_args, train_dataset=train_ds,
-                      eval_dataset=val_ds, data_collator=collator)
+    train_ds = EncodedPairs(train_en, train_hi, tokenizer, architecture, args.max_length)
+    val_ds = EncodedPairs(val_en, val_hi, tokenizer, architecture, args.max_length)
+    collate = make_collator(tokenizer)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=2e-4 if architecture == "causal" else 5e-4)
+    best, best_state, history, stale = float("inf"), None, [], 0
     start = time.perf_counter()
-    result = trainer.train()
+    for epoch in range(int(args.epochs)):
+        model.train(); total = 0.0
+        order = torch.randperm(len(train_en)).tolist()
+        for batch in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+            loss = model(**batch).loss / args.grad_accum
+            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+            total += loss.item() * args.grad_accum
+        model.eval(); val_total = 0.0
+        with torch.inference_mode():
+            for batch in val_loader:
+                batch = {k: v.to(model.device) for k, v in batch.items()}
+                val_total += model(**batch).loss.item()
+        val_loss = val_total / max(1, len(val_loader))
+        history.append({"epoch": epoch + 1, "train_loss": total / max(1, len(train_loader)), "validation_loss": val_loss})
+        print(f"epoch {epoch+1}: validation_loss={val_loss:.4f}", flush=True)
+        if val_loss < best:
+            best, stale = val_loss, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            model.save_pretrained(str(output / "best"))
+        else:
+            stale += 1
+            if stale >= 2: break
     train_seconds = time.perf_counter() - start
-    trainer.save_model(str(output / "model"))
+    if best_state is not None: model.load_state_dict(best_state)
+    model.save_pretrained(str(output / "model"))
     tokenizer.save_pretrained(str(output / "model"))
     model.config.use_cache = True
     model.eval()
@@ -131,8 +152,8 @@ def main() -> None:
         "training_seconds": train_seconds, "inference_seconds": inference_seconds,
         "seconds_per_sentence": inference_seconds / len(test_en),
         "total_parameters": total, "trainable_parameters": trainable,
-        "best_validation_loss": trainer.state.best_metric,
-        "train_loss": result.training_loss, **metrics,
+        "best_validation_loss": best, "train_history": history,
+        **metrics,
     })
     print(json.dumps(metrics, indent=2))
 

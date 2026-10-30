@@ -58,6 +58,11 @@ function Resolve-RunId {
     }
     $revision = 2
     while (Test-Path (Join-Path $repoRoot "outputs\runs\${BaseRunId}_r$revision")) {
+        $revisedRunId = "${BaseRunId}_r$revision"
+        $revisedStatus = Read-RunStatus $revisedRunId
+        if ($null -ne $revisedStatus -and $revisedStatus.state -eq "completed") {
+            return $revisedRunId
+        }
         $revision += 1
     }
     return "${BaseRunId}_r$revision"
@@ -68,8 +73,12 @@ function Ensure-ModelSnapshot {
     $modelFile = Join-Path $LocalPath "model.safetensors"
     if (Test-Path $modelFile) { return }
     Write-QueueStatus "downloading" $ModelId "Downloading model snapshot to $LocalPath"
+    $savedErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $hf download $ModelId --local-dir $LocalPath *> (Join-Path $logs $LogName)
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $modelFile)) {
+    $downloadExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $savedErrorPreference
+    if ($downloadExitCode -ne 0 -or -not (Test-Path $modelFile)) {
         throw "Download failed or model.safetensors is missing for $ModelId."
     }
 }

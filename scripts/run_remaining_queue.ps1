@@ -91,6 +91,11 @@ function Start-CausalRun {
     $stdout = Join-Path $logs "$runId.stdout.log"
     $stderr = Join-Path $logs "$runId.stderr.log"
     Write-QueueStatus "training" $Family "Starting report-grade LoRA training" $runId
+    # Native programs legitimately use stderr for warnings. Temporarily keep
+    # those warnings from becoming terminating PowerShell ErrorRecords and rely
+    # on the process exit code for success/failure instead.
+    $savedErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $python "src\train_causal_lora.py" `
         --model $Family `
         --model-id $ModelId `
@@ -106,8 +111,10 @@ function Start-CausalRun {
         --max-target-length 96 `
         --log-every 100 `
         1> $stdout 2> $stderr
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Family training exited with code $LASTEXITCODE."
+    $trainingExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $savedErrorPreference
+    if ($trainingExitCode -ne 0) {
+        throw "$Family training exited with code $trainingExitCode."
     }
     Assert-CompletedRun $runId
     return $runId

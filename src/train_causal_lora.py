@@ -34,6 +34,14 @@ def prompt_for(source: str) -> str:
     return f"Translate the following English sentence into Hindi.\nEnglish: {source}\nHindi:"
 
 
+def configure_greedy_generation(model):
+    """Remove sampling defaults inherited from instruction-model configs."""
+    model.generation_config.do_sample = False
+    model.generation_config.temperature = None
+    model.generation_config.top_p = None
+    model.generation_config.top_k = None
+
+
 class CausalTranslationDataset(Dataset):
     def __init__(self, sources, targets, tokenizer, max_source_length, max_target_length):
         self.rows = []
@@ -147,6 +155,7 @@ def main():
     )
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.use_cache = False
+    configure_greedy_generation(model)
     model.gradient_checkpointing_enable()
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -345,6 +354,7 @@ def main():
     model = PeftModel.from_pretrained(base_model, run_dir / "best_adapter").to(device)
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.use_cache = True
+    configure_greedy_generation(model)
     model.eval()
     save_json(run_dir / "status.json", {
         "state": "evaluating", "best_epoch": best_epoch,

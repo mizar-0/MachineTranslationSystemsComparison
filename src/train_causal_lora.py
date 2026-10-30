@@ -300,12 +300,9 @@ def main():
                     validation_loss += float(model(**batch).loss)
         train_loss = loss_sum / batches
         val_loss = validation_loss / len(dev_loader)
-        dev_predictions, dev_seconds = timed_generate(
-            lambda items: generate(
-                model, tokenizer, items, args.max_source_length, args.max_target_length,
-            ), dev_en, batch_size=args.generation_batch_size,
-        )
-        dev_metrics = evaluate(dev_predictions, dev_hi)
+        # Preserve the completed epoch before generation-based metrics. This
+        # makes the expensive training work recoverable even if decoding or a
+        # metric library fails afterwards.
         improved = val_loss < best_loss - args.min_delta
         if improved:
             best_loss, best_epoch, stale_epochs = val_loss, epoch, 0
@@ -313,6 +310,19 @@ def main():
         else:
             stale_epochs += 1
         model.save_pretrained(run_dir / "last_adapter", safe_serialization=True)
+        save_json(run_dir / "epoch_checkpoint.json", {
+            "epoch": epoch, "optimizer_step": optimizer_step,
+            "train_loss": train_loss, "validation_loss": val_loss,
+            "best_epoch": best_epoch, "best_validation_loss": best_loss,
+            "stale_epochs": stale_epochs,
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        dev_predictions, dev_seconds = timed_generate(
+            lambda items: generate(
+                model, tokenizer, items, args.max_source_length, args.max_target_length,
+            ), dev_en, batch_size=args.generation_batch_size,
+        )
+        dev_metrics = evaluate(dev_predictions, dev_hi)
         epoch_record = {
             "epoch": epoch, "optimizer_step": optimizer_step,
             "train_loss": train_loss, "validation_loss": val_loss,
